@@ -118,7 +118,18 @@ jobs:
     name: Build Docker (${{ matrix.platform }})
     needs: prepare
     if: needs.prepare.outputs.skip != 'true'
-    runs-on: ${{ matrix.runner }}
+    # Dynamic runner for the amd64 leg only (#11976): the hosted ubuntu-24.04 runner's
+    # 7 GB ceiling no longer fits the release/v3.8.51 tree — every push to that branch
+    # OOMs mid `npm run build` (ResourceExhausted), and the same workflow publishes the
+    # release image on the version tag, so a stuck build ships the release without
+    # Docker. Same dynamic-runner rule as ci.yml's `build` / npm-publish.yml's `publish`:
+    # with the repo var USE_VPS_RUNNER=true, route to the self-hosted omni-build pool
+    # (31 GB) — never for a fork PR (this workflow has no pull_request trigger today,
+    # but the guard is kept verbatim so the expression stays greppable and safe if one
+    # is ever added). The arm64 leg stays on the hosted ubuntu-24.04-arm runner (free
+    # for public repos on GitHub-hosted ARM images) and is therefore still at the
+    # memory ceiling — tracked separately in #11865.
+    runs-on: ${{ (matrix.arch == 'amd64' && vars.USE_VPS_RUNNER == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","omni-build"]') || matrix.runner }}
     permissions:
       contents: read
       packages: write
