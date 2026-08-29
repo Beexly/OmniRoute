@@ -132,7 +132,17 @@ export interface VideoDrilldownLifecycleOptions {
   ttlMs?: number;
 }
 
+/**
+ * Derives the per-principal bookkeeping key from an API-key RECORD ID (`apiKeyInfo.id`),
+ * never from the secret itself. SHA-256 is the correct primitive here and a password KDF
+ * would be wrong: this value is a deterministic index key that must be recomputable on
+ * every lookup, not a stored credential verifier. Same construction and rationale as
+ * `src/lib/db/apiKeys.ts` and `videoBridgeDrilldown.ts`; CodeQL/semgrep flag the
+ * `sha256(<something reached from an apiKey-shaped source>)` shape generically and cannot
+ * see that the input is an opaque row id (issue #11655, Hard Rule #14).
+ */
 function principalDigest(principalId: string): string {
+  // nosemgrep: insufficient-password-hash
   return createHash("sha256").update(principalId, "utf8").digest("hex");
 }
 
