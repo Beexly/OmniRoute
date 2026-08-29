@@ -211,7 +211,10 @@ function buildTranscriptionMultipartBody(
   safeMime: string,
   model: string,
   extraFields: Readonly<Record<string, string>>
-): { body: Buffer; boundary: string } {
+  // Buffer<ArrayBuffer> (what Buffer.concat actually returns), not the wider
+  // Buffer<ArrayBufferLike>: only the former is assignable to fetch's BodyInit under the
+  // open-sse tsconfig, and this body is passed straight to fetch() below (#11654).
+): { body: Buffer<ArrayBuffer>; boundary: string } {
   const fileName = `audio.${format.replace(/[^a-z0-9]/g, "") || "wav"}`;
   const boundary = `----OmniRouteAudioBridge${randomUUID().replace(/-/g, "")}`;
   const CRLF = "\r\n";
