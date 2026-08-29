@@ -37,6 +37,7 @@ const {
   getArenaEloSyncStatus,
   initArenaEloSync,
   stopArenaEloSync,
+  resetArenaEloFetchFailureStreaksForTests,
 } = await import("../../src/lib/arenaEloSync.ts");
 const { setFeatureFlagOverride, removeFeatureFlagOverride } =
   await import("../../src/lib/db/featureFlags.ts");
@@ -629,6 +630,98 @@ describe("fetchArenaLeaderboards()", () => {
         return true;
       }
     );
+  });
+
+  // #11500 sub-issue (3): repeated consecutive timeouts must not spam one
+  // console.warn per category per attempt — the per-category fetch-failure
+  // warning is rate-limited the same way warnEmptyAutoPoolOnce dedupes.
+  it("rate-limits the per-category fetch-failure warning across many consecutive timeouts", async () => {
+    resetArenaEloFetchFailureStreaksForTests();
+    const originalWarn = console.warn;
+    const warnCalls: string[] = [];
+    console.warn = ((...args: unknown[]) => {
+      warnCalls.push(args.map(String).join(" "));
+    }) as typeof console.warn;
+
+    try {
+      mockFetch(async () => {
+        throw new Error("The operation was aborted due to timeout");
+      });
+
+      const ATTEMPTS = 25;
+      for (let i = 0; i < ATTEMPTS; i++) {
+        await assert.rejects(() => fetchArenaLeaderboards());
+      }
+
+      const fetchFailureWarnings = warnCalls.filter((line) =>
+        line.includes('Failed to fetch "text" leaderboard')
+      );
+
+      // One category × 25 consecutive-failure attempts would be 25 raw warns —
+      // the rate limiter must keep the emitted count far below that.
+      assert.ok(
+        fetchFailureWarnings.length < ATTEMPTS,
+        `expected fewer than ${ATTEMPTS} warnings, got ${fetchFailureWarnings.length}`
+      );
+      assert.ok(
+        fetchFailureWarnings.length <= 5,
+        `expected the streak-gated warning to stay tightly bounded, got ${fetchFailureWarnings.length}`
+      );
+      assert.ok(fetchFailureWarnings.length >= 1, "the first failure must still be logged");
+    } finally {
+      console.warn = originalWarn;
+      resetArenaEloFetchFailureStreaksForTests();
+    }
+  });
+
+  it("resets the fetch-failure streak after a successful fetch so the next outage warns again", async () => {
+    resetArenaEloFetchFailureStreaksForTests();
+    const originalWarn = console.warn;
+    const warnCalls: string[] = [];
+    console.warn = ((...args: unknown[]) => {
+      warnCalls.push(args.map(String).join(" "));
+    }) as typeof console.warn;
+
+    try {
+      mockFetch(async () => {
+        throw new Error("timeout");
+      });
+      await assert.rejects(() => fetchArenaLeaderboards());
+      await assert.rejects(() => fetchArenaLeaderboards());
+
+      const textData = makeLeaderboardData(
+        [makeModelEntry({ model: "recovered-model", score: 1200, votes: 5000, rank: 1 })],
+        "text"
+      );
+      const codeData = makeLeaderboardData(
+        [makeModelEntry({ model: "recovered-code", score: 1200, votes: 5000, rank: 1 })],
+        "code"
+      );
+      mockFetch(async (url: string) => {
+        if (url.includes("name=text")) return jsonResponse(textData);
+        if (url.includes("name=code")) return jsonResponse(codeData);
+        return new Response("Not found", { status: 404 });
+      });
+      await fetchArenaLeaderboards();
+
+      mockFetch(async () => {
+        throw new Error("timeout again");
+      });
+      warnCalls.length = 0;
+      await assert.rejects(() => fetchArenaLeaderboards());
+
+      const fetchFailureWarnings = warnCalls.filter((line) =>
+        line.includes('Failed to fetch "text" leaderboard')
+      );
+      assert.strictEqual(
+        fetchFailureWarnings.length,
+        1,
+        "streak reset by the success must re-arm the first-failure warning"
+      );
+    } finally {
+      console.warn = originalWarn;
+      resetArenaEloFetchFailureStreaksForTests();
+    }
   });
 });
 
