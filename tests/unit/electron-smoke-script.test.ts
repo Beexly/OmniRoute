@@ -7,6 +7,8 @@ import {
   FATAL_LOG_PATTERNS,
   LINUX_EXECUTABLE_NAMES,
   stopApp,
+  waitForDriverLine,
+  DB_TOUCH_PATH,
 } from "../../scripts/dev/smoke-electron-packaged.mjs";
 
 test("electron smoke discovers the default Linux executable name", () => {
@@ -95,5 +97,26 @@ test("electron smoke flags startup logs missing any driver selection line", () =
   assert.throws(
     () => assertNativeDriverSelected("[electron] [server] listening on 20128"),
     /no '\[DB\] Driver: \.\.\.' line/
+  );
+});
+
+test("electron smoke waits for the [DB] Driver line after touching a DB-backed endpoint", async () => {
+  assert.equal(DB_TOUCH_PATH, "/api/monitoring/health");
+  let logs = "[electron] [Server] [STARTUP] ready\n";
+  setTimeout(() => {
+    logs += "[electron] [Server] [DB] Driver: better-sqlite3 | file: /tmp/x/storage.sqlite\n";
+  }, 60);
+  const seen = await waitForDriverLine(() => logs, { timeoutMs: 2_000, pollMs: 20 });
+  assert.match(seen, /\[DB\] Driver: better-sqlite3/);
+});
+
+test("electron smoke fails clearly when the database never opens", async () => {
+  await assert.rejects(
+    () =>
+      waitForDriverLine(() => "[electron] [Server] [STARTUP] ready\n", {
+        timeoutMs: 120,
+        pollMs: 20,
+      }),
+    /logged no "\[DB\] Driver: \.\.\." line within 120ms/
   );
 });

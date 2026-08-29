@@ -123,6 +123,46 @@ function discoverPackagedExecutable() {
   throw new Error(`Packaged Electron smoke check does not support ${platform()}.`);
 }
 
+/**
+ * The packaged app opens SQLite lazily: `/login` (the readiness URL) never touches the
+ * database, so a smoke that only waits for readiness sees no "[DB] Driver: ..." line at
+ * all and `assertNativeDriverSelected` cannot tell a native driver from nothing (v3.8.50
+ * re-attach, run 33251755872: every leg green up to the smoke, then this). After readiness
+ * the smoke now requests a DB-backed endpoint and waits for the driver line to appear.
+ */
+export const DB_TOUCH_PATH = "/api/monitoring/health";
+const DB_DRIVER_LINE_PATTERN = /\[DB\] Driver: /;
+
+export async function waitForDriverLine(getLogs, { timeoutMs = 15_000, pollMs = 250 } = {}) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const logs = getLogs();
+    assertNoFatalLogs(logs);
+    if (DB_DRIVER_LINE_PATTERN.test(logs)) return logs;
+    await sleep(pollMs);
+  }
+  throw new Error(
+    `Packaged Electron app logged no "[DB] Driver: ..." line within ${timeoutMs}ms of touching ` +
+      `${DB_TOUCH_PATH} — the database never opened, so the SQLite driver cannot be verified.`
+  );
+}
+
+async function openDatabaseForSmoke({ logs, smokeUrl }) {
+  const touchUrl = new URL(DB_TOUCH_PATH, smokeUrl).toString();
+  try {
+    const response = await fetchWithTimeout(touchUrl, 5_000);
+    console.log(
+      `[electron-smoke] touched ${touchUrl} (HTTP ${response.status}) to open the database`
+    );
+  } catch (error) {
+    console.log(
+      `[electron-smoke] touching ${touchUrl} failed (${error instanceof Error ? error.message : String(error)}) — waiting for the driver line anyway`
+    );
+  }
+  await waitForDriverLine(() => logs.value);
+  console.log("[electron-smoke] database opened — driver line captured");
+}
+
 async function fetchWithTimeout(url, timeoutMs) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -477,6 +517,7 @@ async function waitForReady({ logs, smokeUrl, timeoutMs, settleMs, exitState }) 
       if (response.status === 200) {
         assertNoFatalLogs(logs.value);
         console.log(`[electron-smoke] ready: ${smokeUrl} returned HTTP 200`);
+        await openDatabaseForSmoke({ logs, smokeUrl });
         await settleAfterReady({
           getExitState: () => ({ exitCode: exitState.exitCode, signalCode: exitState.signalCode }),
           logs,
@@ -506,7 +547,14 @@ async function waitForReady({ logs, smokeUrl, timeoutMs, settleMs, exitState }) 
  * by the single-launch path and the cold-restart (two-launch) path so both
  * exercise identical spawn/readiness/shutdown behavior.
  */
-async function launchAndCollectLogs({ appExecutable, smokeUrl, dataDir, timeoutMs, settleMs, streamLogs }) {
+async function launchAndCollectLogs({
+  appExecutable,
+  smokeUrl,
+  dataDir,
+  timeoutMs,
+  settleMs,
+  streamLogs,
+}) {
   const smokeEnv = buildSmokeEnv({ dataDir });
   await assertPortIsFree(smokeUrl);
   await ensureSmokeEnvDirs(smokeEnv, dataDir);
@@ -568,7 +616,14 @@ async function main() {
     !process.env.ELECTRON_SMOKE_DATA_DIR && process.env.ELECTRON_SMOKE_KEEP_DATA !== "1";
 
   try {
-    await launchAndCollectLogs({ appExecutable, smokeUrl, dataDir, timeoutMs, settleMs, streamLogs });
+    await launchAndCollectLogs({
+      appExecutable,
+      smokeUrl,
+      dataDir,
+      timeoutMs,
+      settleMs,
+      streamLogs,
+    });
 
     if (!coldRestart) return;
 
