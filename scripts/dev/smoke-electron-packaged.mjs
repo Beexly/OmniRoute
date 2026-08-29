@@ -125,25 +125,27 @@ function discoverPackagedExecutable() {
 
 /**
  * The packaged app opens SQLite lazily: `/login` (the readiness URL) never touches the
- * database, so a smoke that only waits for readiness sees no "[DB] Driver: ..." line at
- * all and `assertNativeDriverSelected` cannot tell a native driver from nothing (v3.8.50
- * re-attach, run 33251755872: every leg green up to the smoke, then this). After readiness
- * the smoke now requests a DB-backed endpoint and waits for the driver line to appear.
+ * database, so a smoke that only waits for readiness sees no `[DB]` line at all. After
+ * readiness the smoke requests a DB-backed endpoint and waits for evidence that the
+ * database opened. The primary open path does NOT print "[DB] Driver: ..." (only the
+ * recovery path and the sql.js fallback do), so the evidence is any `[DB]`/`[Migration]`
+ * startup line — and the #7592 guard below rejects the fallback's own line explicitly.
  */
 export const DB_TOUCH_PATH = "/api/monitoring/health";
-const DB_DRIVER_LINE_PATTERN = /\[DB\] Driver: /;
+export const DB_OPEN_EVIDENCE_PATTERN =
+  /\[DB\] (Driver: |SQLite database ready|Added [^\n]* column|Changing cache_size|cache_size changed)|\[Migration\] (Applied|Pre-migration backup)/;
 
-export async function waitForDriverLine(getLogs, { timeoutMs = 15_000, pollMs = 250 } = {}) {
+export async function waitForDatabaseOpen(getLogs, { timeoutMs = 15_000, pollMs = 250 } = {}) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
     const logs = getLogs();
     assertNoFatalLogs(logs);
-    if (DB_DRIVER_LINE_PATTERN.test(logs)) return logs;
+    if (DB_OPEN_EVIDENCE_PATTERN.test(logs)) return logs;
     await sleep(pollMs);
   }
   throw new Error(
-    `Packaged Electron app logged no "[DB] Driver: ..." line within ${timeoutMs}ms of touching ` +
-      `${DB_TOUCH_PATH} — the database never opened, so the SQLite driver cannot be verified.`
+    `Packaged Electron app logged no [DB]/[Migration] startup line within ${timeoutMs}ms of ` +
+      `touching ${DB_TOUCH_PATH} — the database never opened, so the SQLite driver cannot be verified.`
   );
 }
 
@@ -156,11 +158,11 @@ async function openDatabaseForSmoke({ logs, smokeUrl }) {
     );
   } catch (error) {
     console.log(
-      `[electron-smoke] touching ${touchUrl} failed (${error instanceof Error ? error.message : String(error)}) — waiting for the driver line anyway`
+      `[electron-smoke] touching ${touchUrl} failed (${error instanceof Error ? error.message : String(error)}) — waiting for the database anyway`
     );
   }
-  await waitForDriverLine(() => logs.value);
-  console.log("[electron-smoke] database opened — driver line captured");
+  await waitForDatabaseOpen(() => logs.value);
+  console.log("[electron-smoke] database opened");
 }
 
 async function fetchWithTimeout(url, timeoutMs) {
@@ -490,8 +492,13 @@ export function assertNativeDriverSelected(logs) {
     );
   }
 
+  // The primary open path prints no "[DB] Driver: ..." line at all (only the recovery path and
+  // the sql.js fallback do), so a database that demonstrably opened WITHOUT the fallback's own
+  // line is the native driver — that is exactly what #7592 guards.
+  if (DB_OPEN_EVIDENCE_PATTERN.test(logs)) return;
+
   throw new Error(
-    "Packaged Electron app logs contain no '[DB] Driver: ...' line — cannot confirm which SQLite " +
+    "Packaged Electron app logs show no database activity at all — cannot confirm which SQLite " +
       "driver loaded."
   );
 }
@@ -517,7 +524,6 @@ async function waitForReady({ logs, smokeUrl, timeoutMs, settleMs, exitState }) 
       if (response.status === 200) {
         assertNoFatalLogs(logs.value);
         console.log(`[electron-smoke] ready: ${smokeUrl} returned HTTP 200`);
-        await openDatabaseForSmoke({ logs, smokeUrl });
         await settleAfterReady({
           getExitState: () => ({ exitCode: exitState.exitCode, signalCode: exitState.signalCode }),
           logs,
@@ -586,6 +592,8 @@ async function launchAndCollectLogs({
 
   try {
     await waitForReady({ logs, smokeUrl, timeoutMs, settleMs, exitState });
+    // Outside waitForReady on purpose: a missing database is a verdict, not a readiness retry.
+    await openDatabaseForSmoke({ logs, smokeUrl });
     return logs.value;
   } catch (error) {
     if (!streamLogs) {
