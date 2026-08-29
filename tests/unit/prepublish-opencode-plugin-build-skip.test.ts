@@ -17,6 +17,8 @@ import { execFileSync } from "node:child_process";
 import { existsSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveLocalBinEntry, isNativeExecutable } from "../../scripts/build/buildToolRunner.mjs";
+import { resolveBundledNpmEntry } from "../../scripts/build/resolveNpmEntry.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, "..", "..");
@@ -26,10 +28,46 @@ const opencodePluginCjs = join(opencodePluginSrc, "dist", "index.cjs");
 
 test("prepublish pluginAlreadyBuilt predicate recognizes a real ESM-only tsup build (#11787)", () => {
   rmSync(join(opencodePluginSrc, "dist"), { recursive: true, force: true });
-  execFileSync(process.execPath, [join(opencodePluginSrc, "node_modules", ".bin", "tsup")], {
-    cwd: opencodePluginSrc,
-    stdio: "inherit",
-  });
+  // The plugin is a standalone package, not an npm workspace member (see
+  // scripts/build/prepublish.ts's own comment above the equivalent build step) — a
+  // root `npm ci` never populates its node_modules, so a fresh checkout (CI, or any
+  // devbox that hasn't built the plugin before) needs its own install first. Mirror
+  // prepublish.ts's own install step instead of hardcoding a `.bin/tsup` path that
+  // only exists on a devbox someone happened to `npm install` in already.
+  if (!existsSync(join(opencodePluginSrc, "node_modules"))) {
+    const npmEntry = resolveBundledNpmEntry("npm-cli.js");
+    const installArgs = ["install", "--no-audit", "--no-fund"];
+    if (npmEntry) {
+      execFileSync(process.execPath, [npmEntry, ...installArgs], {
+        cwd: opencodePluginSrc,
+        stdio: "inherit",
+      });
+    } else {
+      execFileSync("npm", installArgs, { cwd: opencodePluginSrc, stdio: "inherit" });
+    }
+  }
+  // Resolve the real tsup binary the same way scripts/build/prepublish.ts's
+  // runBuildTool() does — never a hardcoded `.bin/tsup` path, since npm's hoisting can
+  // place the binary at the plugin's own node_modules/.bin OR the repo root's,
+  // depending on the install.
+  const localEntry = resolveLocalBinEntry("tsup", "tsup", opencodePluginSrc);
+  if (localEntry) {
+    if (isNativeExecutable(localEntry)) {
+      execFileSync(localEntry, [], { cwd: opencodePluginSrc, stdio: "inherit" });
+    } else {
+      execFileSync(process.execPath, [localEntry], { cwd: opencodePluginSrc, stdio: "inherit" });
+    }
+  } else {
+    const npxEntry = resolveBundledNpmEntry("npx-cli.js");
+    if (npxEntry) {
+      execFileSync(process.execPath, [npxEntry, "tsup"], {
+        cwd: opencodePluginSrc,
+        stdio: "inherit",
+      });
+    } else {
+      execFileSync("npx", ["tsup"], { cwd: opencodePluginSrc, stdio: "inherit" });
+    }
+  }
 
   assert.equal(existsSync(opencodePluginDist), true, "dist/index.js should exist after tsup");
   assert.equal(
