@@ -7,14 +7,17 @@ packages:
 autoInstallPeers: false
 allowBuilds:
   "@parcel/watcher": true
+  "@playwright/browser-chromium": false
   "@swc/core": true
   better-sqlite3: true
+  bun: false
   core-js: true
   esbuild: true
   keytar: true
   koffi: true
   libxmljs2: true
   onnxruntime-node: true
+  opencode-ai: false
   protobufjs: true
   sharp: true
   tls-client-node: true
