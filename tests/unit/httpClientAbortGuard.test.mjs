@@ -250,6 +250,12 @@ test("installProcessCrashGuard() survives the real hedge-cancelled uncaughtExcep
     process.once("exit", (code) => { if (code === 0) console.log("ALIVE"); });
     setTimeout(() => process.exit(0), 50);
     ctl.abort(new Error("hedge-cancelled"));
+    // The verified production route: a leaked upstreamTimeouts abortPromise
+    // listener rejected a promise nothing awaited -> unhandledRejection.
+    Promise.reject(Object.assign(new Error("hedge-cancelled"), { name: "AbortError" }));
+    // streamHandler.ts aborts with raw strings; undici can reject with them verbatim.
+    Promise.reject("hedge-cancelled");
+    Promise.reject("request_signal_aborted");
   `);
   assert.equal(status, 0, "child must survive hedge-cancelled; stderr: " + stderr);
   assert.match(stdout, /ALIVE/);
@@ -266,4 +272,20 @@ test("installProcessCrashGuard still crashes on genuine errors (no over-swallowi
   assert.match(stdout, /LOADED/, "guard must have loaded before the genuine error was raised");
   assert.notEqual(status, 0, "genuine errors must keep crash semantics");
   assert.doesNotMatch(stdout, /SHOULD_NOT_REACH/);
+});
+test("isClientAbortError absorbs raw string abort reasons from streamHandler (undici rejects with signal.reason verbatim)", () => {
+  for (const reason of [
+    "hedge-cancelled",
+    "combo-per-model-timeout",
+    "request_signal_aborted",
+    "client_closed",
+    "cancelled",
+  ]) {
+    assert.equal(isClientAbortError(reason), true, reason + " must be absorbed");
+    assert.equal(shouldSwallowUncaught(reason, "unhandledRejection"), true);
+  }
+  assert.equal(isClientAbortError("genuine failure"), false);
+  assert.equal(isClientAbortError(""), false);
+  assert.equal(isClientAbortError(42), false);
+  assert.equal(isClientAbortError(null), false);
 });
