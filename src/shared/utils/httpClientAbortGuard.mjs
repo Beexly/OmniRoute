@@ -39,11 +39,24 @@
 const COMBO_ABORT_REASONS = new Set(["hedge-cancelled", "combo-per-model-timeout"]);
 
 /**
+ * Raw string reasons open-sse/utils/streamHandler.ts passes to
+ * handleDisconnect() / abortController.abort() when the client goes away.
+ */
+const CLIENT_DISCONNECT_REASONS = new Set(["request_signal_aborted", "client_closed", "cancelled"]);
+
+/**
  * @param {unknown} err
  * @returns {boolean} true when `err` represents a client closing the
  *   connection rather than a server-side fault.
  */
 export function isClientAbortError(err) {
+  // open-sse/utils/streamHandler.ts aborts the stream controller with a RAW
+  // STRING reason (getClientAbortReason / handleDisconnect), and undici rejects
+  // with signal.reason verbatim, so a cancellation can surface at the process
+  // level as a bare string rather than an Error object.
+  if (typeof err === "string") {
+    return COMBO_ABORT_REASONS.has(err) || CLIENT_DISCONNECT_REASONS.has(err);
+  }
   if (!err || typeof err !== "object") return false;
   const e = /** @type {NodeJS.ErrnoException} */ (err);
   // Node emits `Error: aborted` (no code) from http.Server#abortIncoming.
@@ -58,13 +71,19 @@ export function isClientAbortError(err) {
   // Combo dispatch cancels a losing hedged target / a stalled target by
   // aborting with `new Error(reason)` for one of the reasons in
   // open-sse/services/combo/comboAbortReasons.ts (targetTimeoutRunner.ts).
-  // When the client has already disconnected (handleDisconnect →
-  // controller.abort()), a late abort listener re-throws that reason on an
-  // empty stack. Production crash 2026-08-31 (this file, the re-throw below):
+  // streamHandler.ts forwards that reason to the stream controller as a plain
+  // string, and a leaked abort listener in
+  // open-sse/handlers/chatCore/upstreamTimeouts.ts (executeWithUpstreamStartTimeout)
+  // rebuilt it via createAbortError() as an AbortError-named Error to reject a
+  // promise nothing was awaiting. That unhandledRejection reached this guard,
+  // which re-threw it as an uncaughtException. Production exit 2026-08-31:
   //   Error [AbortError]: hedge-cancelled
+  // The listener leak is fixed at the source; this stays as the last-resort net.
   // A sibling target winning / a target stalling is never a server fault, so
   // match the exact reason text whatever `name` the thrower stamped on it.
-  // Inlined (not imported) so this .mjs stays dependency-free for the launcher.
+  // Inlined rather than imported from comboAbortReasons.ts: this file runs
+  // under plain node (scripts/dev/run-next.mjs, no tsx) and must not depend on
+  // type-stripping being available for that .ts module.
   if (COMBO_ABORT_REASONS.has(String(e.message))) return true;
   switch (e.code) {
     case "ERR_STREAM_PREMATURE_CLOSE":
