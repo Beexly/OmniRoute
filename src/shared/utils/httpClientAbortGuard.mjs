@@ -33,6 +33,12 @@
  */
 
 /**
+ * Abort reasons raised by combo target dispatch. Mirror of
+ * open-sse/services/combo/comboAbortReasons.ts — keep the two in sync.
+ */
+const COMBO_ABORT_REASONS = new Set(["hedge-cancelled", "combo-per-model-timeout"]);
+
+/**
  * @param {unknown} err
  * @returns {boolean} true when `err` represents a client closing the
  *   connection rather than a server-side fault.
@@ -42,6 +48,24 @@ export function isClientAbortError(err) {
   const e = /** @type {NodeJS.ErrnoException} */ (err);
   // Node emits `Error: aborted` (no code) from http.Server#abortIncoming.
   if (e.message === "aborted" || e.message === "Aborted") return true;
+  // OmniRoute's SSE teardown aborts in-flight legs with
+  // `Error [AbortError]: request_signal_aborted` on client disconnects
+  // (open-sse/utils/streamHandler.ts), and fetch/DOM cancellation surfaces as
+  // `AbortError` with an abort-flavoured message. Same benign class as
+  // `Error: aborted` — an emitter-left 'error' event on any of these used to
+  // kill the process (#fix-dev-server-aborted).
+  if (e.name === "AbortError" && /abort/i.test(String(e.message))) return true;
+  // Combo dispatch cancels a losing hedged target / a stalled target by
+  // aborting with `new Error(reason)` for one of the reasons in
+  // open-sse/services/combo/comboAbortReasons.ts (targetTimeoutRunner.ts).
+  // When the client has already disconnected (handleDisconnect →
+  // controller.abort()), a late abort listener re-throws that reason on an
+  // empty stack. Production crash 2026-08-31 (this file, the re-throw below):
+  //   Error [AbortError]: hedge-cancelled
+  // A sibling target winning / a target stalling is never a server fault, so
+  // match the exact reason text whatever `name` the thrower stamped on it.
+  // Inlined (not imported) so this .mjs stays dependency-free for the launcher.
+  if (COMBO_ABORT_REASONS.has(String(e.message))) return true;
   switch (e.code) {
     case "ERR_STREAM_PREMATURE_CLOSE":
     case "ECONNRESET":
