@@ -7,10 +7,11 @@
  */
 
 import { EXECUTOR_CONTRACT_VIOLATION_CODE } from "../../config/constants.ts";
+import { remainingPercentFromQuotaWindows } from "../antigravityQuotaFamily.ts";
 import { errorResponse } from "../../utils/error.ts";
 import { parseModel } from "../model.ts";
 import { isSelfInflictedUpstreamTimeout } from "../../handlers/chatCore/cooldownClassification.ts";
-import { isLocalStreamLifecycleError } from "@/shared/utils/circuitBreaker";
+import { isLocalStreamLifecycleError, isLocalExecutionError } from "@/shared/utils/circuitBreaker";
 import { CONTEXT_OVERFLOW_PATTERNS, MODEL_ACCESS_DENIED_PATTERNS } from "../accountFallback.ts";
 import { isResourceNotFoundResponse } from "../errorClassifier.ts";
 import { getTrustedLocalRateLimitResponse } from "../rateLimitManager/errors.ts";
@@ -216,7 +217,8 @@ export function shouldRecordProviderBreakerFailure(args: {
     (!args.sameProviderNext || args.isProxyUnreachable === true) &&
     !args.skipProviderBreaker &&
     !args.requestScopedFailure &&
-    !isLocalStreamLifecycleError(args.error)
+    !isLocalStreamLifecycleError(args.error) &&
+    !isLocalExecutionError(args.error)
   );
 }
 
@@ -313,6 +315,7 @@ export function shouldSkipConnDisable(
     // Client abort surfaced as a bare error (no statusCode → defaults to 502):
     // a local lifecycle event, not a provider failure (#4602 policy).
     isLocalStreamLifecycleError(result.error) ||
+    isLocalExecutionError(result.error) ||
     (result.response ? getTrustedLocalRateLimitResponse(result.response) !== null : false) ||
     result.errorCode === "plugin_block" ||
     result.errorType === "plugin_block" ||
@@ -429,23 +432,23 @@ export function clampPercent(value: number): number {
   return Math.max(0, Math.min(100, value));
 }
 
-export function quotaRemainingPercentFromQuota(quota: unknown): number {
+export function quotaRemainingPercentFromQuota(
+  quota: unknown,
+  scope?: { provider?: string | null; requestedModel?: string | null }
+): number {
   if (!quota || typeof quota !== "object") return 100;
   const record = quota as Record<string, unknown>;
-  if (record.limitReached === true) return 0;
 
   const windows = record.windows;
   if (windows && typeof windows === "object" && !Array.isArray(windows)) {
-    let minRemaining: number | null = null;
-    for (const windowInfo of Object.values(windows as Record<string, unknown>)) {
-      if (!windowInfo || typeof windowInfo !== "object") continue;
-      const percentUsed = Number((windowInfo as Record<string, unknown>).percentUsed);
-      if (!Number.isFinite(percentUsed)) continue;
-      const remaining = clampPercent((1 - percentUsed) * 100);
-      minRemaining = minRemaining === null ? remaining : Math.min(minRemaining, remaining);
-    }
-    if (minRemaining !== null) return minRemaining;
+    const fromWindows = remainingPercentFromQuotaWindows(
+      windows as Record<string, unknown>,
+      scope
+    );
+    if (fromWindows !== null) return fromWindows;
   }
+
+  if (record.limitReached === true) return 0;
 
   const percentUsed = Number(record.percentUsed);
   if (Number.isFinite(percentUsed)) return clampPercent((1 - percentUsed) * 100);
@@ -468,6 +471,30 @@ export function hasFutureRateLimitUntil(value: unknown): boolean {
   if (value == null || value === "") return false;
   const time = new Date(String(value)).getTime();
   return Number.isFinite(time) && time > Date.now();
+}
+
+/**
+ * #12168: mirrors ERROR_LABEL_GRACE_MS in src/lib/quota/connectionRecovery.ts — a
+ * bare status label with no cooldown timestamp is only trusted while the failure
+ * that wrote it is recent. Kept in sync with that constant deliberately: both
+ * answer the same question ("is this label still meaningful?") and they must not
+ * disagree, or a connection the recovery job considers healthy would still be
+ * pre-skipped by combo dispatch.
+ */
+const UNAVAILABLE_LABEL_GRACE_MS = 60 * 1000;
+
+/**
+ * True when a bare `unavailable` label should still be honoured: the recorded
+ * failure is inside the grace window. A missing/unparseable lastErrorAt is
+ * treated as stale (not blocking) — an unbounded skip is exactly the failure
+ * mode #12168 reported, and one extra upstream attempt is far cheaper than a
+ * permanently dark connection pool.
+ */
+export function isWithinUnavailableGrace(lastErrorAt: unknown): boolean {
+  if (lastErrorAt == null || lastErrorAt === "") return false;
+  const time = new Date(String(lastErrorAt)).getTime();
+  if (!Number.isFinite(time)) return false;
+  return Date.now() - time < UNAVAILABLE_LABEL_GRACE_MS;
 }
 
 export function getConnectionStatusQuotaCutoffReason(
@@ -506,13 +533,28 @@ export function getPersistedConnectionCooldownSkipReason(
   if (QUOTA_BLOCKING_CONNECTION_STATUSES.has(status)) {
     return `Skipping ${target.modelStr} — connection ${target.connectionId} status=${status}`;
   }
-  // `unavailable` with no (or an already-expired) rateLimitedUntil still means AUTH
-  // took this connection out of rotation — markAccountUnavailable() writes the status
-  // before, and sometimes without, a timestamp ("Using zai account …" then a real
-  // upstream 429). Without this branch the pre-skip only fired once the timestamp had
-  // landed, so a burst still dispatched against a connection AUTH had already retired.
-  // Lazy recovery is unaffected: clearAccountError() resets the status on first success.
-  if (status === "unavailable") {
+  // `unavailable` with no rateLimitedUntil still means AUTH took this connection out
+  // of rotation — markAccountUnavailable() writes the status before, and sometimes
+  // without, a timestamp ("Using zai account …" then a real upstream 429). Without
+  // this branch a burst still dispatched against a connection AUTH had already retired.
+  //
+  // #12168: but the skip must be BOUNDED. The original version returned here for any
+  // `unavailable` row, which is the raw-label anti-pattern AGENTS.md warns about — the
+  // resilience layers are supposed to recover lazily. Its stated justification
+  // ("clearAccountError() resets the status on first success") does not hold on this
+  // path: this gate runs BEFORE dispatch, so it prevents the very successful request
+  // that would call clearAccountError(). A connection left with a stale `unavailable`
+  // label and no timestamp could therefore never dispatch again, and the out-of-band
+  // recovery job cannot rescue it either — hasElapsedCooldown() there requires a
+  // rateLimitedUntil to be present. Result: a whole combo pool could report
+  // ALL_TARGETS_SKIPPED with zero upstream attempts, forever.
+  //
+  // Bound it the same way src/lib/quota/connectionRecovery.ts bounds a bare error
+  // label: honour the skip only while the failure is recent (lastErrorAt within the
+  // grace window). Past that, treat the label as stale and let the request through —
+  // one real attempt then either succeeds (clearing the status) or re-arms the
+  // cooldown with a fresh timestamp.
+  if (status === "unavailable" && isWithinUnavailableGrace(connection.lastErrorAt)) {
     return `Skipping ${target.modelStr} — connection ${target.connectionId} status=unavailable`;
   }
   return null;

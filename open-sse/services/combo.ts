@@ -231,6 +231,8 @@ export {
 import { applyComboTargetExhaustion } from "./combo/targetExhaustion.ts";
 import {
   applyNativeCodexTurnPin,
+  areAllPinnedTargetsModelScopedUnusable,
+  createPinnedModelUnavailableResponse,
   getNativeCodexTurnPin,
   pinNativeCodexTurn,
 } from "./combo/nativeCodexTurnPin.ts";
@@ -611,12 +613,13 @@ export async function buildAutoCandidates(
         const quota = await quotaPromises.get(quotaKey)!;
         resetWindowAffinity = calculateResetWindowAffinity(quota, resetWindowConfig);
         if (!quotaCutoffBlocked) {
-          quotaRemaining = quotaRemainingPercentFromQuota(quota);
+          quotaRemaining = quotaRemainingPercentFromQuota(quota, { provider, requestedModel: modelStr });
         }
         if (!quotaCutoffBlocked && quotaCutoffEnabled) {
           const cutoffDecision = evaluateQuotaCutoff(
             quota as QuotaInfo | null,
-            buildAutoQuotaThresholds(provider, connection, resilienceSettings)
+            buildAutoQuotaThresholds(provider, connection, resilienceSettings),
+            { provider, requestedModel: modelStr }
           );
           if (!cutoffDecision.proceed) {
             quotaCutoffBlocked = true;
@@ -960,30 +963,49 @@ async function handleComboChatInner({
   const { stickyWeightedLimit, getWeightedStepKeyForTarget, preScreenMap } = targetResolution;
   const _sticky = targetResolution.sticky;
   let orderedTargets = targetResolution.orderedTargets;
+  const quotaCutoffResetWindowConfig = resolveResetWindowConfig(config as Record<string, unknown>);
+
   if (activeNativeTurnPin) {
-    orderedTargets = applyNativeCodexTurnPin(orderedTargets, activeNativeTurnPin);
-    if (orderedTargets.length === 0) {
-      // #11371: quota-share ordering already reserved a winner slot; release it on
-      // this early exit (idempotent).
+    const pinnedTargets = applyNativeCodexTurnPin(orderedTargets, activeNativeTurnPin);
+    if (pinnedTargets.length === 0) {
+      //#11371: quota-share ordering reserved a winner slot; release on
+      //early exit (idempotent).
       targetResolution.quotaShareRelease?.();
-      return errorResponse(
-        409,
-        "The pinned native Codex turn target is no longer available; the turn cannot be moved to another provider"
+      log.warn(
+        "COMBO",
+        `Native Codex turn cannot continue: pinned model ${activeNativeTurnPin.modelStr} unavailable (target not in combo); preserving turn pin and terminating turn`
+      );
+      return createPinnedModelUnavailableResponse();
+    }
+    const allPinnedUnusable = await areAllPinnedTargetsModelScopedUnusable({
+      pinnedTargets,
+      resilienceSettings,
+      quotaCutoffResetWindowConfig,
+      comboName: combo.name,
+      body: body as Record<string, unknown>,
+      log,
+      isModelAvailable,
+    });
+    if (allPinnedUnusable) {
+      targetResolution.quotaShareRelease?.();
+      log.warn(
+        "COMBO",
+        `Native Codex turn cannot continue: pinned model ${activeNativeTurnPin.modelStr} is unavailable (model-scoped); preserving turn pin and terminating turn`
+      );
+      return createPinnedModelUnavailableResponse();
+    } else {
+      orderedTargets = pinnedTargets;
+      log.info(
+        "COMBO",
+        `Native Codex turn pinned to ${activeNativeTurnPin.modelStr} on connection ${activeNativeTurnPin.connectionId.slice(0, 8)}`
       );
     }
-    log.info(
-      "COMBO",
-      `Native Codex turn pinned to ${activeNativeTurnPin.modelStr} connection ${activeNativeTurnPin.connectionId.slice(0, 8)}`
-    );
   }
 
   // #5923 (Finding #4) — reset-window config for the shared per-target quota-
   // exhaustion cutoff below. The "auto" strategy already applies its own cutoff
   // via buildAutoCandidates/routableCandidates, so this only affects the other
   // 16 strategies (priority, weighted, etc.) that funnel through executeTarget.
-  const quotaCutoffResetWindowConfig = resolveResetWindowConfig(config as Record<string, unknown>);
-
-  // QA P0 diagnostics: record the order in which targets were actually attempted
   // (provider/model ids only) so a terminal combo failure can report the attempt
   // sequence alongside pool size + exhaustion reasons. Accumulates across set retries.
   const comboAttemptOrder: Array<{ provider: string; model: string }> = [];
@@ -1111,8 +1133,19 @@ async function handleComboChatInner({
     let lastError: string | null = null;
     let earliestRetryAfter: ComboRetryAfter | null = null;
     let lastStatus: number | null = null;
+    // #11804: the loop-safety timer is armed per setTry iteration but must be
+    // cleared on EVERY exit path, not just the happy one. Hoisted to function
+    // scope so the `finally` at the end of this function always reaches it —
+    // otherwise each error path (all_targets_skipped / all_accounts_inactive /
+    // aggregated status / final fallback / global timeout) returned to the client
+    // leaving a 10-minute timer pending, whose closure retains orderedTargets and
+    // the exhausted provider/connection sets. Field evidence on the issue: the
+    // client got a 502 immediately, and "Combo loop safety timeout ...
+    // force-terminating" was logged exactly 600s later.
+    let activeLoopSafetyTimer: ReturnType<typeof setTimeout> | null = null;
 
-    for (let setTry = 0; setTry <= maxSetRetries; setTry++) {
+    try {
+      for (let setTry = 0; setTry <= maxSetRetries; setTry++) {
       // #1731: Per-set-iteration set of providers whose quota is fully exhausted.
       // Reset each retry so providers excluded in a previous attempt get another chance.
       const exhaustedProviders = new Set<string>();
@@ -1198,6 +1231,7 @@ async function handleComboChatInner({
           );
         }, loopSafetyMs);
         loopSafetyTimer.unref?.();
+        activeLoopSafetyTimer = loopSafetyTimer;
       });
       const runningTasks = new Set<Promise<void>>();
       let anySuccess = false;
@@ -1253,7 +1287,8 @@ async function handleComboChatInner({
         if (
           resilienceSettings.providerCooldown.enabled &&
           Boolean(provider && provider !== "unknown") &&
-          isProviderInCooldown(provider, target.connectionId ?? undefined, resilienceSettings)
+          (isProviderInCooldown(provider, target.connectionId ?? undefined, resilienceSettings) ||
+            isProviderInCooldown(provider, undefined, resilienceSettings))
         ) {
           log.info("COMBO", `Skipping ${modelStr} — provider ${provider} in global cooldown`);
           recordComboDecision(traceInvocationId, {
@@ -1345,7 +1380,7 @@ async function handleComboChatInner({
             resilienceSettings,
             quotaCutoffResetWindowConfig,
             combo.name,
-            log
+            log, modelStr
           );
           if (quotaCutoff.blocked) {
             log.info(
@@ -1626,8 +1661,16 @@ async function handleComboChatInner({
             }
           }
 
-          // Universal handoff: inject existing handoff if model changed
+          // Universal handoff: inject existing handoff if model changed. i === 0
+          // only: a fallback target (i > 0) serves the SAME client request the
+          // failed primary target would have served, with the original messages
+          // already intact -- there's nothing to hand off, since the client never
+          // saw the earlier target fail. Injecting a handoff note there replaces
+          // real context with a context-free note, which weaker fallback models
+          // have been observed treating as license to fabricate content instead
+          // of just answering the actual request (#12227 follow-up).
           if (
+            i === 0 &&
             universalHandoffConfig.enabled &&
             relayOptions?.sessionId &&
             !(body as Record<string, unknown>)?.[SKIP_UNIVERSAL_HANDOFF_FLAG]
@@ -1893,7 +1936,14 @@ async function handleComboChatInner({
                 provider,
                 target.connectionId ?? undefined
               );
-              if (prevModel && prevModel !== modelStr) {
+              // i === 0 only: a same-request fallback target (i > 0) never
+              // needs a summary generated for it -- see the injection-site
+              // comment above. recordSessionModelUsage above stays
+              // unconditional regardless of i: it must reflect whichever
+              // model actually served THIS response, since the next
+              // request's i === 0 comparison depends on that being
+              // accurate even when this response came from a fallback.
+              if (i === 0 && prevModel && prevModel !== modelStr) {
                 const handoffSourceMessages =
                   Array.isArray(body?.messages) && body.messages.length > 0
                     ? body.messages
@@ -2870,11 +2920,20 @@ async function handleComboChatInner({
     // Surface the recovery hint with a generic retry recommendation so the client at least
     // gets a non-opaque message instead of "Combo routing completed without an upstream response".
     recordComboFailure(effectiveSessionId, combo.name);
-    return errorResponseWithComboDiagnostics(
-      503,
-      "Combo routing completed without an upstream response",
-      buildNoUpstreamResponseDiagnostics(orderedTargets.length)
-    );
+      return errorResponseWithComboDiagnostics(
+        503,
+        "Combo routing completed without an upstream response",
+        buildNoUpstreamResponseDiagnostics(orderedTargets.length)
+      );
+    } finally {
+      // #11804: always release the loop-safety timer. Covering every exit path by
+      // construction here means a future `return` added to this function cannot
+      // silently reintroduce the leak.
+      if (activeLoopSafetyTimer) {
+        clearTimeout(activeLoopSafetyTimer);
+        activeLoopSafetyTimer = null;
+      }
+    }
   };
 
   // FASE 2.1: acquire the per-connection concurrency slot for the selected
@@ -3972,8 +4031,5 @@ async function handleRoundRobinCombo({
   }
 
   log.warn("COMBO-RR", `All models failed | ${msg}`);
-  return new Response(JSON.stringify({ error: { message: msg } }), {
-    status,
-    headers: { "Content-Type": "application/json" },
-  });
+  return new Response(JSON.stringify({ error: { message: msg } }), { status, headers: { "Content-Type": "application/json" } });
 }
