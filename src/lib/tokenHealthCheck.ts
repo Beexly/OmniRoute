@@ -13,7 +13,8 @@
 
 import { getProviderConnections, updateProviderConnection } from "@/lib/db/providers";
 import { getCachedProviderConnectionById } from "@/lib/db/readCache";
-import { getSettings, resolveProxyForConnection } from "@/lib/db/settings";
+import { getSettings } from "@/lib/db/settings";
+import { resolveGuardedProxyConfig } from "@/lib/tokenHealthCheckProxyGuard";
 import {
   getAccessToken,
   getDeprecationNotice,
@@ -30,6 +31,10 @@ import {
   checkWebCookieConnectionIfNeeded,
   isWebCookieHealthProbeCandidate,
 } from "@/lib/tokenHealthCheckWebCookie";
+import {
+  isInRefreshBackoff,
+  preservesRefreshTokenOnUnrecoverable,
+} from "@/lib/tokenRefreshCircuit";
 
 const LOG_PREFIX = "[HealthCheck]";
 const TRUE_ENV_VALUES = new Set(["1", "true", "yes", "on"]);
@@ -173,12 +178,10 @@ export function getRefreshBackoffUntil(streak: number, now: string): string {
   return new Date(new Date(now).getTime() + backoffMin * 60 * 1000).toISOString();
 }
 
-export function isInRefreshBackoff(conn: any, nowMs: number): boolean {
-  const until = conn?.providerSpecificData?.refreshCircuit?.until;
-  if (typeof until !== "string") return false;
-  const untilMs = new Date(until).getTime();
-  return Number.isFinite(untilMs) && untilMs > nowMs;
-}
+// Both live in `@/lib/tokenRefreshCircuit` so CredentialHealth can import them
+// without pulling this module's auto-starting scheduler. Re-exported for
+// existing callers and tests.
+export { isInRefreshBackoff, preservesRefreshTokenOnUnrecoverable };
 
 export function buildRefreshFailureUpdate(
   conn: any,
@@ -564,18 +567,11 @@ export async function checkConnection(conn) {
     }
   }
 
-  // #8182: skip terminal connections (credits_exhausted / banned / expired).
-  // These can never self-heal via a token refresh — probing them wastes
-  // CPU and network on every sweep cycle. Mirrors isTerminalConnectionStatus
-  // in src/sse/services/auth.ts and TERMINAL_CONNECTION_STATUSES in
-  // src/lib/quota/connectionRecovery.ts.
-  //
-  // #5326 exception: a GitHub Copilot access-token-only connection parked in
-  // "expired" with errorCode "no_refresh_token" is NOT actually terminal — it's
-  // the exact target of the self-heal below (canClearGitHubNoRefreshTokenState),
-  // which clears that stale status back to "active" once the Copilot sub-token
-  // proves usable. Treating it as terminal here made that self-heal unreachable,
-  // leaving healthy Copilot connections stuck at "expired" forever.
+  // #8182: skip banned/expired (dead credentials). credits_exhausted is a
+  // renewing window — keep sweeping so OAuth refresh can clear a false mark.
+  // #5326: GitHub Copilot access-token-only "expired" + no_refresh_token is
+  // the self-heal target below (canClearGitHubNoRefreshTokenState). Treating
+  // it as terminal made that heal unreachable and stuck healthy Copilot rows.
   const isRecoverableGithubCopilotNoRefresh =
     conn.testStatus === "expired" &&
     conn.errorCode === "no_refresh_token" &&
@@ -596,7 +592,8 @@ export async function checkConnection(conn) {
     conn.testStatus === "expired" &&
     conn.lastErrorType !== "account_deactivated" &&
     getExpiredRetryCount(conn) < EXPIRED_RETRY_MAX;
-  const terminalStatuses = new Set(["credits_exhausted", "banned", "expired"]);
+  // Skip only banned/expired. Combo pre-skip still hides exhausted rows.
+  const terminalStatuses = new Set(["banned", "expired"]);
   if (
     typeof conn.testStatus === "string" &&
     terminalStatuses.has(conn.testStatus.toLowerCase()) &&
@@ -707,8 +704,9 @@ export async function checkConnection(conn) {
 
       let refreshedProviderSpecificData: Record<string, unknown> | null = null;
       const hideLogs = await shouldHideLogs();
-      const proxyResolution = await resolveProxyForConnection(conn.id);
-      const proxyConfig = extractResolvedProxyConfig(proxyResolution);
+      const { proxyConfig, blocked } = await resolveGuardedProxyConfig(conn.id, conn.provider);
+      if (blocked)
+        return void logWarn(`#13470 proxy-pool guard: skipping Copilot refresh for ${conn.id}`);
       const healthCheckLog = {
         info: (tag: string, msg: string) => {
           if (!hideLogs) console.log(LOG_PREFIX, `[${tag}]`, msg);
@@ -914,8 +912,9 @@ export async function checkConnection(conn) {
   };
 
   const hideLogs = await shouldHideLogs();
-  const proxyResolution = await resolveProxyForConnection(conn.id);
-  const proxyConfig = extractResolvedProxyConfig(proxyResolution);
+  const { proxyConfig, blocked } = await resolveGuardedProxyConfig(conn.id, conn.provider);
+  if (blocked)
+    return void logWarn(`#13470 proxy-pool guard: skipping token refresh for ${conn.id}`);
 
   const healthCheckLog = {
     info: (tag: string, msg: string) => {
@@ -1132,7 +1131,11 @@ export async function checkConnection(conn) {
       // gemini) the stored refresh_token is the user's only recovery
       // artifact — nulling it caused #3679 (the connection reports "No valid refresh
       // token available" and can never recover even after re-activation). Preserve it.
-      ...(isRotatingProvider ? { refreshToken: null } : {}),
+      // PRESERVE_REFRESH_TOKEN_PROVIDERS (Claude) opt out too: nulling on the first
+      // failure makes the #11414 retry budget above unreachable (#13183).
+      ...(isRotatingProvider && !preservesRefreshTokenOnUnrecoverable(conn.provider)
+        ? { refreshToken: null }
+        : {}),
     });
     logError(
       `${LOG_PREFIX} ✗ ${conn.provider}/${getConnectionLogLabel(conn)} — ` +

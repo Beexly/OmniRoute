@@ -1,13 +1,13 @@
 import { HTTP_STATUS, FETCH_TIMEOUT_MS } from "../config/constants.ts";
-import { getRegistryEntry } from "../config/providerRegistry.ts";
+import { getRegistryEntry, requireCompatibleBaseUrl } from "../config/providerRegistry.ts";
 import { resolveFetchStartTimeout } from "../utils/fetchStartTimeoutPolicy.ts";
 import {
   resolveAlternateFormat,
   type AlternateFormat,
 } from "../config/providers/alternateFormats.ts";
 import {
-  CLAUDE_CLI_BILLING_VERSION,
   CLAUDE_CLI_STAINLESS_RUNTIME_VERSION,
+  getClaudeCliBillingVersion,
   mergeClientAnthropicBeta,
   normalizeAnthropicHeaderVariants,
 } from "../config/anthropicHeaders.ts";
@@ -30,11 +30,7 @@ import {
   addParamToBlocklist,
   isAutoLearnGloballyEnabled,
 } from "@/lib/db/paramFilters";
-import {
-  applyFingerprint,
-  isCliCompatEnabled,
-  stripInternalBodyFields,
-} from "../config/cliFingerprints.ts";
+import { applyFingerprint, isCliCompatEnabled, stripInternalBodyFields } from "../config/cliFingerprints.ts"; // prettier-ignore
 import { supportsClaudeMaxEffort, supportsXHighEffort } from "../config/providerModels.ts";
 import { getThinkingBudgetConfig, ThinkingMode } from "../services/thinkingBudget.ts";
 import {
@@ -68,7 +64,7 @@ import {
   appendAnthropicBetaHeader,
   CLAUDE_CODE_COMPATIBLE_REDACT_THINKING_BETA,
   CONTEXT_1M_BETA_HEADER,
-  enforceThinkingTemperature,
+  finalizeClaudeBodyConstraints,
   modelHasNativeContext1m,
   modelSupportsContext1mBeta,
 } from "../services/claudeCodeCompatible.ts";
@@ -90,7 +86,7 @@ import {
 } from "../services/contextManager.ts";
 import { randomUUID } from "node:crypto";
 import {
-  CLAUDE_CODE_VERSION,
+  getClaudeCodeVersion,
   CLAUDE_CODE_STAINLESS_VERSION,
   buildUserIdJson,
   getSessionId,
@@ -217,6 +213,8 @@ export type ExecuteInput = {
   ) => Promise<void> | void;
   /** When true, skip the intra-URL 429 retry in execute() so the caller handles fallback. */
   skipUpstreamRetry?: boolean;
+  /** Request-scoped id for log attribution; absent off the chat path, never fabricated. */
+  correlationId?: string | null;
   /** Delegated Context Editing (Claude only): when enabled, attach the
    * `context_management.clear_tool_uses` strategy so the provider clears stale
    * tool-use blocks server-side. Honored only on the genuine `claude` path. */
@@ -361,7 +359,7 @@ export class BaseExecutor {
     void stream;
     if (this.provider?.startsWith?.("openai-compatible-")) {
       const psd = credentials?.providerSpecificData;
-      const baseUrl = typeof psd?.baseUrl === "string" ? psd.baseUrl : "https://api.openai.com/v1";
+      const baseUrl = requireCompatibleBaseUrl(this.provider, psd); // #13452
       const normalized = baseUrl.replace(/\/$/, "");
       // Sanitize custom path: must start with '/', no path traversal, no null bytes
       const rawPath = typeof psd?.chatPath === "string" && psd.chatPath ? psd.chatPath : null;
@@ -1146,7 +1144,7 @@ export class BaseExecutor {
 
           // system[0] (billing) and system[1] (sentinel) must not carry
           // cache_control — that belongs on upstream prompt blocks at [2..].
-          const billingLine = `x-anthropic-billing-header: cc_version=${CLAUDE_CLI_BILLING_VERSION}; cc_entrypoint=cli; cch=00000;`;
+          const billingLine = `x-anthropic-billing-header: cc_version=${getClaudeCliBillingVersion()}; cc_entrypoint=cli; cch=00000;`;
           const SENTINEL = "You are Claude Code, Anthropic's official CLI for Claude.";
 
           const sysBlocks: Array<Record<string, unknown>> = Array.isArray(tb.system)
@@ -1242,7 +1240,7 @@ export class BaseExecutor {
               ),
               "anthropic-dangerous-direct-browser-access": "true",
               "x-app": "cli",
-              "User-Agent": `claude-cli/${CLAUDE_CODE_VERSION} (external, cli)`,
+              "User-Agent": `claude-cli/${getClaudeCodeVersion()} (external, cli)`,
               "X-Stainless-Package-Version": CLAUDE_CODE_STAINLESS_VERSION,
               "X-Stainless-Timeout": "600",
               "accept-encoding": "gzip, deflate, br, zstd",
@@ -1349,7 +1347,7 @@ export class BaseExecutor {
         // routing mode (grouped/raw/combo) and the native passthrough share,
         // before fingerprinting and CCH signing serialize the body.
         if (this.provider === "claude" || usesClaudeCodeProtocol) {
-          enforceThinkingTemperature(transformedBody as Record<string, unknown>);
+          finalizeClaudeBodyConstraints(transformedBody as Record<string, unknown>);
         }
 
         // Delegated Context Editing (opt-in): attach the clear_tool_uses strategy so

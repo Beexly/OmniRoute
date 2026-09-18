@@ -5,7 +5,7 @@ import { ANTHROPIC_VERSION_HEADER } from "../config/anthropicHeaders.ts";
 import {
   CLAUDE_CODE_COMPATIBLE_STAINLESS_PACKAGE_VERSION,
   CLAUDE_CODE_COMPATIBLE_STAINLESS_RUNTIME_VERSION,
-  CLAUDE_CODE_COMPATIBLE_USER_AGENT,
+  getClaudeCodeUserAgent,
 } from "../config/claudeCodeCompatibleIdentity.ts";
 import { supportsClaudeMaxEffort, supportsXHighEffort } from "../config/providerModels.ts";
 import { prepareClaudeRequest } from "../translator/helpers/claudeHelper.ts";
@@ -183,7 +183,7 @@ export function buildClaudeCodeCompatibleHeaders(
     }),
     "anthropic-dangerous-direct-browser-access": "true",
     "x-app": "cli",
-    "User-Agent": CLAUDE_CODE_COMPATIBLE_USER_AGENT,
+    "User-Agent": getClaudeCodeUserAgent("sdk-cli"),
     "X-Stainless-Retry-Count": "0",
     "X-Stainless-Timeout": String(CLAUDE_CODE_COMPATIBLE_STAINLESS_TIMEOUT_SECONDS),
     "X-Stainless-Lang": "js",
@@ -403,6 +403,7 @@ export { computeFingerprint } from "./claudeCodeFingerprint.ts";
 export { obfuscateSensitiveWords, setSensitiveWords } from "./claudeCodeObfuscation.ts";
 export {
   enforceThinkingTemperature,
+  finalizeClaudeBodyConstraints,
   disableThinkingIfToolChoiceForced,
   enforceCacheControlLimit,
 } from "./claudeCodeConstraints.ts";
