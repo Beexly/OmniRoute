@@ -4,6 +4,7 @@ import assert from "node:assert";
 import { test } from "node:test";
 import { EventEmitter } from "node:events";
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import {
   isClientAbortError,
   shouldSwallowUncaught,
@@ -288,4 +289,39 @@ test("isClientAbortError absorbs raw string abort reasons from streamHandler (un
   assert.equal(isClientAbortError(""), false);
   assert.equal(isClientAbortError(42), false);
   assert.equal(isClientAbortError(null), false);
+});
+
+// A swallowed error is the ONLY evidence it ever happened; logging just
+// code/message throws away the stack. The logger must receive the full
+// error object so the origin stays diagnosable.
+test("installProcessCrashGuard logs the full error object for swallowed errors", async () => {
+  const guardPath = fileURLToPath(
+    new URL("../../src/shared/utils/httpClientAbortGuard.mjs", import.meta.url)
+  );
+  const script = `
+    const { installProcessCrashGuard } = await import(process.argv[1]);
+    installProcessCrashGuard((level, ...args) => {
+      console.log(
+        "LOGARGS",
+        level,
+        args.map((a) => (a instanceof Error ? "Error" : typeof a)).join(",")
+      );
+    });
+    process.emit(
+      "unhandledRejection",
+      Object.assign(new Error("hedge-cancelled"), { name: "AbortError" }),
+      Promise.resolve()
+    );
+  `;
+  const { status, stdout } = await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["--input-type=module", "-e", script, guardPath], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    child.stdout.on("data", (d) => (out += d));
+    child.on("close", (status) => resolve({ status, stdout: out }));
+    child.on("error", reject);
+  });
+  assert.equal(status, 0);
+  assert.match(stdout, /LOGARGS warn string,Error/);
 });
