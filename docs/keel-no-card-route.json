@@ -1,0 +1,14 @@
+{
+  "locked": "2026-10-14",
+  "skipIfCardRequired": true,
+  "noCardOrder": [
+    "Google Gemini",
+    "Groq",
+    "Cloudflare Workers AI",
+    "Mistral AI",
+    "Cerebras",
+    "Kilo Code",
+    "LLM7.io"
+  ],
+  "note": "This file is not read by the router. It is the order to apply when a provider is opened on purpose."
+}
